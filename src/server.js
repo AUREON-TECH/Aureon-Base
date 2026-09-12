@@ -12,6 +12,7 @@ import { registerPlatformAdminRoutes } from './platformAdmin.js';
 import { registerConsoleRoutes } from './console.js';
 import { registerRealtimeRoutes } from './realtime.js';
 import { issuePasswordResetToken, consumePasswordResetToken, hashResetToken } from './passwordRecovery.js';
+import { verifyGoogleCredential } from './googleAuth.js';
 
 const app = express();
 app.disable('x-powered-by');
@@ -175,6 +176,11 @@ app.get('/ready', async (_req, res) => {
   return res.status(503).json({ ok: false, database: 'offline', ...health });
 });
 
+app.get('/auth/google/config', (_req, res) => {
+  const clientId = String(process.env.GOOGLE_CLIENT_ID || '').trim();
+  res.json({ enabled: Boolean(clientId), client_id: clientId || null });
+});
+
 app.post('/auth/register', authLimit, async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
   const password = String(req.body?.password || '');
@@ -214,6 +220,41 @@ app.post('/auth/login', authLimit, async (req, res) => {
   } catch (err) {
     console.error('login_error', err);
     res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.post('/auth/google', authLimit, async (req, res) => {
+  const credential = String(req.body?.credential || '').trim();
+  const projectSlug = String(req.body?.project_slug || '').trim().toLowerCase();
+  if (!projectSlug || projectSlug.length > 80) return res.status(400).json({ error: 'invalid_google_login' });
+  try {
+    const identity = await verifyGoogleCredential({
+      credential,
+      expectedClientId: process.env.GOOGLE_CLIENT_ID,
+    });
+    const found = await query('select id,email,is_active,is_superadmin from users where email=$1', [identity.email]);
+    const user = found.rows[0];
+    if (!user || !user.is_active) return res.status(401).json({ error: 'google_user_not_allowed' });
+
+    const membership = await projectMembership(projectSlug, user.id);
+    if (!membership || !membership.is_active) return res.status(403).json({ error: 'project_forbidden' });
+    const subscription = await subscriptionFor(membership.id, user.id);
+    const access = accessState(subscription);
+    if (!access.allowed) return res.status(402).json({ error: 'subscription_required', access });
+
+    await audit({ userId: user.id, projectId: membership.id, event: 'user.google_login', req, metadata: { project: projectSlug } });
+    const tokens = await issueSession(user);
+    res.json({
+      user: { id: user.id, email: user.email, is_superadmin: user.is_superadmin },
+      project: { slug: membership.slug, name: membership.name },
+      access,
+      ...tokens,
+    });
+  } catch (err) {
+    if (err?.code === 'google_auth_not_configured') return res.status(503).json({ error: 'google_auth_not_configured' });
+    if (err?.code === 'google_token_invalid') return res.status(401).json({ error: 'invalid_google_credential' });
+    console.error('google_login_error', err);
+    return res.status(500).json({ error: 'internal_error' });
   }
 });
 
