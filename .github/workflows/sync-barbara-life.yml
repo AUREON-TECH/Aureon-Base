@@ -1,0 +1,65 @@
+name: Sync Barbara Life
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-barbara-life
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Aureon Base
+        uses: actions/checkout@v4
+        with:
+          path: aureon-base
+
+      - name: Checkout Barbara Life
+        uses: actions/checkout@v4
+        with:
+          repository: raphaelbuenocaptacao-creator/B-RBARA-LIFE-di-rio-da-vida-dela
+          ref: main
+          path: barbara-life
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build Barbara Life
+        working-directory: barbara-life
+        env:
+          GITHUB_PAGES: 'true'
+        run: |
+          npm install
+          npm run build
+          grep -RIl '/B-RBARA-LIFE-di-rio-da-vida-dela/' dist | xargs -r sed -i 's#/B-RBARA-LIFE-di-rio-da-vida-dela/#/barbara-life/#g'
+
+      - name: Publish into Aureon Base public folder
+        run: |
+          rm -rf aureon-base/public/barbara-life
+          mkdir -p aureon-base/public/barbara-life
+          cp -R barbara-life/dist/. aureon-base/public/barbara-life/
+
+      - name: Commit mirror when changed
+        working-directory: aureon-base
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add public/barbara-life
+          if git diff --cached --quiet; then
+            echo 'Barbara Life mirror already up to date.'
+            exit 0
+          fi
+          git commit -m 'deploy: sync Barbara Life static mirror'
+          git push origin HEAD:main
