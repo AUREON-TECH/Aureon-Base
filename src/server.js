@@ -64,6 +64,7 @@ app.use(apiLimit);
 
 const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const allowedEmails = (process.env.ALLOWED_EMAILS || '').split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
+const publicSignupProjects = (process.env.PUBLIC_SIGNUP_PROJECTS || 'tradevision').split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
 const lifetimeEmails = (process.env.LIFETIME_EMAILS || '').split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
 const hashToken = token => crypto.createHash('sha256').update(String(token)).digest('hex');
 
@@ -164,6 +165,13 @@ async function enrollUser({ userId, email, project }) {
     await query(`insert into subscriptions(project_id,user_id,status) values($1,$2,'lifetime') on conflict(project_id,user_id) do update set status='lifetime',updated_at=now()`, [project.id, userId]);
     return;
   }
+  if (project.slug === 'tradevision') {
+    const planCode = 'free';
+    const freePlan = await query('select id from plans where project_id=$1 and code=$2 and is_active=true', [project.id, planCode]);
+    if (!freePlan.rows[0]) throw new Error('tradevision_free_plan_missing');
+    await query(`insert into subscriptions(project_id,user_id,plan_id,status) values($1,$2,$3,'active') on conflict(project_id,user_id) do nothing`, [project.id, userId, freePlan.rows[0].id]);
+    return;
+  }
   await query(`insert into subscriptions(project_id,user_id,status,trial_started_at,trial_ends_at) values($1,$2,'trialing',now(),now()+($3 || ' days')::interval) on conflict(project_id,user_id) do nothing`, [project.id, userId, String(project.trial_days)]);
 }
 
@@ -186,7 +194,7 @@ app.post('/auth/register', authLimit, async (req, res) => {
   const password = String(req.body?.password || '');
   const projectSlug = String(req.body?.project_slug || process.env.DEFAULT_PROJECT_SLUG || 'tradevision').trim().toLowerCase();
   if (!emailRegex.test(email) || password.length < 10 || password.length > 128) return res.status(400).json({ error: 'invalid_credentials' });
-  if (allowedEmails.length && !allowedEmails.includes(email)) return res.status(403).json({ error: 'email_not_allowed' });
+  if (allowedEmails.length && !publicSignupProjects.includes(projectSlug) && !allowedEmails.includes(email)) return res.status(403).json({ error: 'email_not_allowed' });
   const project = await projectBySlug(projectSlug);
   if (!project || !project.is_active) return res.status(404).json({ error: 'project_not_found' });
   try {
@@ -228,28 +236,18 @@ app.post('/auth/google', authLimit, async (req, res) => {
   const projectSlug = String(req.body?.project_slug || '').trim().toLowerCase();
   if (!projectSlug || projectSlug.length > 80) return res.status(400).json({ error: 'invalid_google_login' });
   try {
-    const identity = await verifyGoogleCredential({
-      credential,
-      expectedClientId: process.env.GOOGLE_CLIENT_ID,
-    });
+    const identity = await verifyGoogleCredential({ credential, expectedClientId: process.env.GOOGLE_CLIENT_ID });
     const found = await query('select id,email,is_active,is_superadmin from users where email=$1', [identity.email]);
     const user = found.rows[0];
     if (!user || !user.is_active) return res.status(401).json({ error: 'google_user_not_allowed' });
-
     const membership = await projectMembership(projectSlug, user.id);
     if (!membership || !membership.is_active) return res.status(403).json({ error: 'project_forbidden' });
     const subscription = await subscriptionFor(membership.id, user.id);
     const access = accessState(subscription);
     if (!access.allowed) return res.status(402).json({ error: 'subscription_required', access });
-
     await audit({ userId: user.id, projectId: membership.id, event: 'user.google_login', req, metadata: { project: projectSlug } });
     const tokens = await issueSession(user);
-    res.json({
-      user: { id: user.id, email: user.email, is_superadmin: user.is_superadmin },
-      project: { slug: membership.slug, name: membership.name },
-      access,
-      ...tokens,
-    });
+    res.json({ user: { id: user.id, email: user.email, is_superadmin: user.is_superadmin }, project: { slug: membership.slug, name: membership.name }, access, ...tokens });
   } catch (err) {
     if (err?.code === 'google_auth_not_configured') return res.status(503).json({ error: 'google_auth_not_configured' });
     if (err?.code === 'google_token_invalid') return res.status(401).json({ error: 'invalid_google_credential' });
@@ -313,10 +311,7 @@ app.post('/auth/request-password-reset', resetRequestLimit, async (req, res) => 
     const issued = await issuePasswordResetToken({ query, userId: user.id, requestedIp: req.ip });
     const sent = await sendRecoveryEmail(user.email, issued.token);
     if (!sent) {
-      await query(
-        'update password_reset_tokens set used_at=coalesce(used_at,now()) where user_id=$1 and token_hash=$2 and used_at is null',
-        [user.id, hashResetToken(issued.token)],
-      );
+      await query('update password_reset_tokens set used_at=coalesce(used_at,now()) where user_id=$1 and token_hash=$2 and used_at is null', [user.id, hashResetToken(issued.token)]);
     }
     await audit({ userId: user.id, event: 'user.password_reset_requested', req, metadata: { delivered: sent, expires_in_minutes: issued.expiresInMinutes } });
     return res.status(202).json({ ok: true });
@@ -392,17 +387,9 @@ app.post('/admin/users/:userId/reset-code', requireAuth, requireSuperAdmin, asyn
   const issued = await issuePasswordResetToken({ query, userId: user.id, requestedIp: req.ip });
   const sent = await sendRecoveryEmail(user.email, issued.token);
   if (!sent) {
-    await query(
-      'update password_reset_tokens set used_at=coalesce(used_at,now()) where user_id=$1 and token_hash=$2 and used_at is null',
-      [user.id, hashResetToken(issued.token)],
-    );
+    await query('update password_reset_tokens set used_at=coalesce(used_at,now()) where user_id=$1 and token_hash=$2 and used_at is null', [user.id, hashResetToken(issued.token)]);
   }
-  await audit({
-    userId: req.user.sub,
-    event: 'admin.password_reset_requested',
-    req,
-    metadata: { target_user_id: user.id, delivered: sent, expires_in_minutes: issued.expiresInMinutes },
-  });
+  await audit({ userId: req.user.sub, event: 'admin.password_reset_requested', req, metadata: { target_user_id: user.id, delivered: sent, expires_in_minutes: issued.expiresInMinutes } });
   if (!sent) return res.status(503).json({ error: 'email_delivery_failed' });
   return res.status(202).json({ ok: true, email: user.email, expires_in_minutes: issued.expiresInMinutes });
 });
@@ -475,32 +462,9 @@ app.put('/projects/:slug/settings', requireAuth, async (req, res) => {
   res.json(saved.rows[0]);
 });
 
-registerPlatformDataRoutes({
-  app,
-  query,
-  requireAuth,
-  projectMembership,
-  subscriptionFor,
-  accessState,
-  audit,
-});
-
-registerPlatformAdminRoutes({
-  app,
-  query,
-  requireAuth,
-  requireSuperAdmin,
-  projectBySlug,
-  audit,
-});
-
-registerRealtimeRoutes({
-  app,
-  requireAuth,
-  ensureProjectAccess,
-  withTenantContext,
-  audit,
-});
+registerPlatformDataRoutes({ app, query, requireAuth, projectMembership, subscriptionFor, accessState, audit });
+registerPlatformAdminRoutes({ app, query, requireAuth, requireSuperAdmin, projectBySlug, audit });
+registerRealtimeRoutes({ app, requireAuth, ensureProjectAccess, withTenantContext, audit });
 
 app.use((_req, res) => res.status(404).json({ error: 'not_found' }));
 app.use((err, _req, res, _next) => {
