@@ -14,8 +14,8 @@ test('TradeVision is explicitly configured for public signup without opening eve
 
 test('new TradeVision users are enrolled into an active Free plan rather than a time-limited trial', () => {
   assert.match(server, /project\.slug\s*===\s*'tradevision'/);
-  assert.match(server, /plan_code\s*=\s*'free'/);
-  assert.match(server, /status[^\n]*'active'/);
+  assert.match(server, /planCode\s*=\s*'free'/);
+  assert.match(server, /insert into subscriptions\(project_id,user_id,plan_id,status\)[^`]*'active'/s);
 });
 
 test('TradeVision freemium migration defines permanent Free and Pro monthly plans', () => {
