@@ -10,7 +10,7 @@ test('subscription lookup exposes plan features for entitlement enforcement', ()
 
 test('TradeVision Free enforces its monthly operation limit in the backend before insert', () => {
   assert.match(server, /monthly_operation_limit_reached/);
-  assert.match(server, /date_trunc\('month',\s*operated_at\)/i);
+  assert.match(server, /date_trunc\('month',\s*created_at\)/i);
   assert.match(server, /operations_month/);
   assert.match(server, /used\s*>=\s*limit/);
 });
