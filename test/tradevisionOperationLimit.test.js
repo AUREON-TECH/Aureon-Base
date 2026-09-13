@@ -15,6 +15,11 @@ test('TradeVision Free enforces its monthly operation limit in the backend befor
   assert.match(server, /used\s*>=\s*limit/);
 });
 
+test('monthly cap is checked under a transaction-scoped lock so concurrent writes cannot exceed the limit', () => {
+  assert.match(server, /pg_advisory_xact_lock/i);
+  assert.match(server, /withTransaction\(async\s+transactionQuery/);
+});
+
 test('an unlimited plan skips the monthly cap instead of inventing a large limit', () => {
   assert.match(server, /limit\s*===\s*null/);
   assert.match(server, /unlimited:\s*true/);
