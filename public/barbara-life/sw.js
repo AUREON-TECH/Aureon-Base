@@ -1,5 +1,5 @@
 const CACHE_PREFIX = 'barbara-life-'
-const CACHE_NAME = 'barbara-life-shell-v3'
+const CACHE_NAME = 'barbara-life-shell-v4-private-vary-range-safe'
 const BASE = '/barbara-life/'
 const APP_SHELL = [
   BASE,
@@ -42,7 +42,7 @@ function isCacheableResponse(response) {
   const vary = response.headers.get('vary') || ''
   if (/no-store|private/i.test(cacheControl)) return false
   if (response.headers.has('set-cookie') || response.headers.has('content-range')) return false
-  if (/authorization|cookie/i.test(vary)) return false
+  if (/authorization|cookie|range|if-range/i.test(vary)) return false
   return true
 }
 
