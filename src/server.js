@@ -129,7 +129,7 @@ async function projectMembership(slug, userId) {
 }
 
 async function subscriptionFor(projectId, userId) {
-  const result = await query(`select s.*,pl.code as plan_code,pl.name as plan_name,pl.price_cents,pl.currency,pl.interval from subscriptions s left join plans pl on pl.id=s.plan_id where s.project_id=$1 and s.user_id=$2`, [projectId, userId]);
+  const result = await query(`select s.*,pl.code as plan_code,pl.name as plan_name,pl.price_cents,pl.currency,pl.interval,pl.features as plan_features from subscriptions s left join plans pl on pl.id=s.plan_id where s.project_id=$1 and s.user_id=$2`, [projectId, userId]);
   return result.rows[0] || null;
 }
 
@@ -142,6 +142,22 @@ function accessState(subscription) {
     return { allowed: true, status: 'trialing', reason: null, trial_days_remaining: Math.max(0, Math.ceil(ms / 86400000)) };
   }
   return { allowed: false, status: subscription.status, reason: subscription.status === 'trialing' ? 'trial_expired' : 'subscription_inactive' };
+}
+
+function monthlyOperationLimit(subscription) {
+  const features = subscription?.plan_features;
+  if (!features || !Object.prototype.hasOwnProperty.call(features, 'operations_month')) return null;
+  if (features.operations_month === null) return null;
+  const limit = Number(features.operations_month);
+  return Number.isInteger(limit) && limit >= 0 ? limit : 0;
+}
+
+async function operationUsage({ queryFn, projectId, userId, subscription }) {
+  const limit = monthlyOperationLimit(subscription);
+  if (limit === null) return { unlimited: true, limit: null, used: null, remaining: null };
+  const count = await queryFn(`select count(*)::int as used from trading_operations where project_id=$1 and user_id=$2 and date_trunc('month', created_at)=date_trunc('month', now())`, [projectId, userId]);
+  const used = Number(count.rows[0]?.used || 0);
+  return { unlimited: false, limit, used, remaining: Math.max(0, limit - used) };
 }
 
 async function ensureProjectAccess(req, res) {
@@ -435,9 +451,20 @@ app.post('/projects/:slug/operations', requireAuth, async (req, res) => {
   const note = String(req.body?.note || '').trim().slice(0, 1000);
   const operatedAt = new Date(req.body?.operated_at);
   if (!asset || asset.length > 20 || !['Compra', 'Venda'].includes(side) || !Number.isInteger(contracts) || contracts < 1 || contracts > 1000 || !Number.isFinite(resultValue) || !Number.isFinite(stopPlanned) || stopPlanned < 0 || Number.isNaN(operatedAt.getTime())) return res.status(400).json({ error: 'invalid_operation' });
-  const row = await query(`insert into trading_operations(id,project_id,user_id,asset,side,contracts,result,stop_planned,setup,note,operated_at) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) returning *`, [uuid(), ctx.membership.id, req.user.sub, asset, side, contracts, resultValue, stopPlanned, setup, note, operatedAt.toISOString()]);
-  await audit({ userId: req.user.sub, projectId: ctx.membership.id, event: 'trade.operation.created', req, metadata: { operation_id: row.rows[0].id } });
-  res.status(201).json(row.rows[0]);
+
+  const created = await withTransaction(async transactionQuery => {
+    const lockKey = `tradevision:${ctx.membership.id}:${req.user.sub}:${new Date().toISOString().slice(0, 7)}`;
+    await transactionQuery('select pg_advisory_xact_lock(hashtextextended($1,0))', [lockKey]);
+    const usage = await operationUsage({ queryFn: transactionQuery, projectId: ctx.membership.id, userId: req.user.sub, subscription: ctx.subscription });
+    const { limit, used } = usage;
+    if (!usage.unlimited && used >= limit) return { blocked: true, usage };
+    const row = await transactionQuery(`insert into trading_operations(id,project_id,user_id,asset,side,contracts,result,stop_planned,setup,note,operated_at) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) returning *`, [uuid(), ctx.membership.id, req.user.sub, asset, side, contracts, resultValue, stopPlanned, setup, note, operatedAt.toISOString()]);
+    return { blocked: false, usage, row: row.rows[0] };
+  });
+
+  if (created.blocked) return res.status(403).json({ error: 'monthly_operation_limit_reached', usage: created.usage });
+  await audit({ userId: req.user.sub, projectId: ctx.membership.id, event: 'trade.operation.created', req, metadata: { operation_id: created.row.id } });
+  res.status(201).json(created.row);
 });
 
 app.delete('/projects/:slug/operations/:id', requireAuth, async (req, res) => {
