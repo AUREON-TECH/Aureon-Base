@@ -30,3 +30,7 @@ test('project access response includes current operation usage for the UI', () =
   assert.match(accessRoute, /operationUsage/);
   assert.match(accessRoute, /usage/);
 });
+
+test('trading settings persist the validated snake_case values in parameter order', () => {
+  assert.match(server, /values\.daily_stop\s*,\s*values\.daily_target\s*,\s*values\.base_contracts\s*,\s*values\.profit_step\s*,\s*values\.max_contracts/);
+});
