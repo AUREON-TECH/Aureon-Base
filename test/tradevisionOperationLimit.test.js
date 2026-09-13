@@ -24,3 +24,9 @@ test('an unlimited plan skips the monthly cap instead of inventing a large limit
   assert.match(server, /limit\s*===\s*null/);
   assert.match(server, /unlimited:\s*true/);
 });
+
+test('project access response includes current operation usage for the UI', () => {
+  const accessRoute = server.match(/app\.get\('\/projects\/:slug\/access'[\s\S]*?\n\}\);/i)?.[0] || '';
+  assert.match(accessRoute, /operationUsage/);
+  assert.match(accessRoute, /usage/);
+});
