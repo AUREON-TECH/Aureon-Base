@@ -64,6 +64,7 @@ app.use(apiLimit);
 
 const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const allowedEmails = (process.env.ALLOWED_EMAILS || '').split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
+const publicSignupProjects = (process.env.PUBLIC_SIGNUP_PROJECTS || 'tradevision').split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
 const lifetimeEmails = (process.env.LIFETIME_EMAILS || '').split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
 const hashToken = token => crypto.createHash('sha256').update(String(token)).digest('hex');
 
@@ -128,7 +129,7 @@ async function projectMembership(slug, userId) {
 }
 
 async function subscriptionFor(projectId, userId) {
-  const result = await query(`select s.*,pl.code as plan_code,pl.name as plan_name,pl.price_cents,pl.currency,pl.interval from subscriptions s left join plans pl on pl.id=s.plan_id where s.project_id=$1 and s.user_id=$2`, [projectId, userId]);
+  const result = await query(`select s.*,pl.code as plan_code,pl.name as plan_name,pl.price_cents,pl.currency,pl.interval,pl.features as plan_features from subscriptions s left join plans pl on pl.id=s.plan_id where s.project_id=$1 and s.user_id=$2`, [projectId, userId]);
   return result.rows[0] || null;
 }
 
@@ -141,6 +142,22 @@ function accessState(subscription) {
     return { allowed: true, status: 'trialing', reason: null, trial_days_remaining: Math.max(0, Math.ceil(ms / 86400000)) };
   }
   return { allowed: false, status: subscription.status, reason: subscription.status === 'trialing' ? 'trial_expired' : 'subscription_inactive' };
+}
+
+function monthlyOperationLimit(subscription) {
+  const features = subscription?.plan_features;
+  if (!features || !Object.prototype.hasOwnProperty.call(features, 'operations_month')) return null;
+  if (features.operations_month === null) return null;
+  const limit = Number(features.operations_month);
+  return Number.isInteger(limit) && limit >= 0 ? limit : 0;
+}
+
+async function operationUsage({ queryFn, projectId, userId, subscription }) {
+  const limit = monthlyOperationLimit(subscription);
+  if (limit === null) return { unlimited: true, limit: null, used: null, remaining: null };
+  const count = await queryFn(`select count(*)::int as used from trading_operations where project_id=$1 and user_id=$2 and date_trunc('month', created_at)=date_trunc('month', now())`, [projectId, userId]);
+  const used = Number(count.rows[0]?.used || 0);
+  return { unlimited: false, limit, used, remaining: Math.max(0, limit - used) };
 }
 
 async function ensureProjectAccess(req, res) {
@@ -162,6 +179,13 @@ async function enrollUser({ userId, email, project }) {
   await query(`insert into project_users(project_id,user_id,role) values($1,$2,'member') on conflict(project_id,user_id) do nothing`, [project.id, userId]);
   if (lifetimeEmails.includes(email)) {
     await query(`insert into subscriptions(project_id,user_id,status) values($1,$2,'lifetime') on conflict(project_id,user_id) do update set status='lifetime',updated_at=now()`, [project.id, userId]);
+    return;
+  }
+  if (project.slug === 'tradevision') {
+    const planCode = 'free';
+    const freePlan = await query('select id from plans where project_id=$1 and code=$2 and is_active=true', [project.id, planCode]);
+    if (!freePlan.rows[0]) throw new Error('tradevision_free_plan_missing');
+    await query(`insert into subscriptions(project_id,user_id,plan_id,status) values($1,$2,$3,'active') on conflict(project_id,user_id) do nothing`, [project.id, userId, freePlan.rows[0].id]);
     return;
   }
   await query(`insert into subscriptions(project_id,user_id,status,trial_started_at,trial_ends_at) values($1,$2,'trialing',now(),now()+($3 || ' days')::interval) on conflict(project_id,user_id) do nothing`, [project.id, userId, String(project.trial_days)]);
@@ -186,7 +210,7 @@ app.post('/auth/register', authLimit, async (req, res) => {
   const password = String(req.body?.password || '');
   const projectSlug = String(req.body?.project_slug || process.env.DEFAULT_PROJECT_SLUG || 'tradevision').trim().toLowerCase();
   if (!emailRegex.test(email) || password.length < 10 || password.length > 128) return res.status(400).json({ error: 'invalid_credentials' });
-  if (allowedEmails.length && !allowedEmails.includes(email)) return res.status(403).json({ error: 'email_not_allowed' });
+  if (allowedEmails.length && !publicSignupProjects.includes(projectSlug) && !allowedEmails.includes(email)) return res.status(403).json({ error: 'email_not_allowed' });
   const project = await projectBySlug(projectSlug);
   if (!project || !project.is_active) return res.status(404).json({ error: 'project_not_found' });
   try {
@@ -228,28 +252,18 @@ app.post('/auth/google', authLimit, async (req, res) => {
   const projectSlug = String(req.body?.project_slug || '').trim().toLowerCase();
   if (!projectSlug || projectSlug.length > 80) return res.status(400).json({ error: 'invalid_google_login' });
   try {
-    const identity = await verifyGoogleCredential({
-      credential,
-      expectedClientId: process.env.GOOGLE_CLIENT_ID,
-    });
+    const identity = await verifyGoogleCredential({ credential, expectedClientId: process.env.GOOGLE_CLIENT_ID });
     const found = await query('select id,email,is_active,is_superadmin from users where email=$1', [identity.email]);
     const user = found.rows[0];
     if (!user || !user.is_active) return res.status(401).json({ error: 'google_user_not_allowed' });
-
     const membership = await projectMembership(projectSlug, user.id);
     if (!membership || !membership.is_active) return res.status(403).json({ error: 'project_forbidden' });
     const subscription = await subscriptionFor(membership.id, user.id);
     const access = accessState(subscription);
     if (!access.allowed) return res.status(402).json({ error: 'subscription_required', access });
-
     await audit({ userId: user.id, projectId: membership.id, event: 'user.google_login', req, metadata: { project: projectSlug } });
     const tokens = await issueSession(user);
-    res.json({
-      user: { id: user.id, email: user.email, is_superadmin: user.is_superadmin },
-      project: { slug: membership.slug, name: membership.name },
-      access,
-      ...tokens,
-    });
+    res.json({ user: { id: user.id, email: user.email, is_superadmin: user.is_superadmin }, project: { slug: membership.slug, name: membership.name }, access, ...tokens });
   } catch (err) {
     if (err?.code === 'google_auth_not_configured') return res.status(503).json({ error: 'google_auth_not_configured' });
     if (err?.code === 'google_token_invalid') return res.status(401).json({ error: 'invalid_google_credential' });
@@ -313,10 +327,7 @@ app.post('/auth/request-password-reset', resetRequestLimit, async (req, res) => 
     const issued = await issuePasswordResetToken({ query, userId: user.id, requestedIp: req.ip });
     const sent = await sendRecoveryEmail(user.email, issued.token);
     if (!sent) {
-      await query(
-        'update password_reset_tokens set used_at=coalesce(used_at,now()) where user_id=$1 and token_hash=$2 and used_at is null',
-        [user.id, hashResetToken(issued.token)],
-      );
+      await query('update password_reset_tokens set used_at=coalesce(used_at,now()) where user_id=$1 and token_hash=$2 and used_at is null', [user.id, hashResetToken(issued.token)]);
     }
     await audit({ userId: user.id, event: 'user.password_reset_requested', req, metadata: { delivered: sent, expires_in_minutes: issued.expiresInMinutes } });
     return res.status(202).json({ ok: true });
@@ -368,7 +379,8 @@ app.get('/projects/:slug/access', requireAuth, async (req, res) => {
   const membership = await projectMembership(req.params.slug, req.user.sub);
   if (!membership) return res.status(403).json({ error: 'project_forbidden' });
   const subscription = await subscriptionFor(membership.id, req.user.sub);
-  res.json({ project: membership, subscription, access: accessState(subscription) });
+  const usage = await operationUsage({ queryFn: query, projectId: membership.id, userId: req.user.sub, subscription });
+  res.json({ project: membership, subscription, access: accessState(subscription), usage });
 });
 
 app.get('/projects/:slug/plans', async (req, res) => {
@@ -392,17 +404,9 @@ app.post('/admin/users/:userId/reset-code', requireAuth, requireSuperAdmin, asyn
   const issued = await issuePasswordResetToken({ query, userId: user.id, requestedIp: req.ip });
   const sent = await sendRecoveryEmail(user.email, issued.token);
   if (!sent) {
-    await query(
-      'update password_reset_tokens set used_at=coalesce(used_at,now()) where user_id=$1 and token_hash=$2 and used_at is null',
-      [user.id, hashResetToken(issued.token)],
-    );
+    await query('update password_reset_tokens set used_at=coalesce(used_at,now()) where user_id=$1 and token_hash=$2 and used_at is null', [user.id, hashResetToken(issued.token)]);
   }
-  await audit({
-    userId: req.user.sub,
-    event: 'admin.password_reset_requested',
-    req,
-    metadata: { target_user_id: user.id, delivered: sent, expires_in_minutes: issued.expiresInMinutes },
-  });
+  await audit({ userId: req.user.sub, event: 'admin.password_reset_requested', req, metadata: { target_user_id: user.id, delivered: sent, expires_in_minutes: issued.expiresInMinutes } });
   if (!sent) return res.status(503).json({ error: 'email_delivery_failed' });
   return res.status(202).json({ ok: true, email: user.email, expires_in_minutes: issued.expiresInMinutes });
 });
@@ -448,9 +452,20 @@ app.post('/projects/:slug/operations', requireAuth, async (req, res) => {
   const note = String(req.body?.note || '').trim().slice(0, 1000);
   const operatedAt = new Date(req.body?.operated_at);
   if (!asset || asset.length > 20 || !['Compra', 'Venda'].includes(side) || !Number.isInteger(contracts) || contracts < 1 || contracts > 1000 || !Number.isFinite(resultValue) || !Number.isFinite(stopPlanned) || stopPlanned < 0 || Number.isNaN(operatedAt.getTime())) return res.status(400).json({ error: 'invalid_operation' });
-  const row = await query(`insert into trading_operations(id,project_id,user_id,asset,side,contracts,result,stop_planned,setup,note,operated_at) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) returning *`, [uuid(), ctx.membership.id, req.user.sub, asset, side, contracts, resultValue, stopPlanned, setup, note, operatedAt.toISOString()]);
-  await audit({ userId: req.user.sub, projectId: ctx.membership.id, event: 'trade.operation.created', req, metadata: { operation_id: row.rows[0].id } });
-  res.status(201).json(row.rows[0]);
+
+  const created = await withTransaction(async transactionQuery => {
+    const lockKey = `tradevision:${ctx.membership.id}:${req.user.sub}:${new Date().toISOString().slice(0, 7)}`;
+    await transactionQuery('select pg_advisory_xact_lock(hashtextextended($1,0))', [lockKey]);
+    const usage = await operationUsage({ queryFn: transactionQuery, projectId: ctx.membership.id, userId: req.user.sub, subscription: ctx.subscription });
+    const { limit, used } = usage;
+    if (!usage.unlimited && used >= limit) return { blocked: true, usage };
+    const row = await transactionQuery(`insert into trading_operations(id,project_id,user_id,asset,side,contracts,result,stop_planned,setup,note,operated_at) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) returning *`, [uuid(), ctx.membership.id, req.user.sub, asset, side, contracts, resultValue, stopPlanned, setup, note, operatedAt.toISOString()]);
+    return { blocked: false, usage, row: row.rows[0] };
+  });
+
+  if (created.blocked) return res.status(403).json({ error: 'monthly_operation_limit_reached', usage: created.usage });
+  await audit({ userId: req.user.sub, projectId: ctx.membership.id, event: 'trade.operation.created', req, metadata: { operation_id: created.row.id } });
+  res.status(201).json(created.row);
 });
 
 app.delete('/projects/:slug/operations/:id', requireAuth, async (req, res) => {
@@ -475,32 +490,9 @@ app.put('/projects/:slug/settings', requireAuth, async (req, res) => {
   res.json(saved.rows[0]);
 });
 
-registerPlatformDataRoutes({
-  app,
-  query,
-  requireAuth,
-  projectMembership,
-  subscriptionFor,
-  accessState,
-  audit,
-});
-
-registerPlatformAdminRoutes({
-  app,
-  query,
-  requireAuth,
-  requireSuperAdmin,
-  projectBySlug,
-  audit,
-});
-
-registerRealtimeRoutes({
-  app,
-  requireAuth,
-  ensureProjectAccess,
-  withTenantContext,
-  audit,
-});
+registerPlatformDataRoutes({ app, query, requireAuth, projectMembership, subscriptionFor, accessState, audit });
+registerPlatformAdminRoutes({ app, query, requireAuth, requireSuperAdmin, projectBySlug, audit });
+registerRealtimeRoutes({ app, requireAuth, ensureProjectAccess, withTenantContext, audit });
 
 app.use((_req, res) => res.status(404).json({ error: 'not_found' }));
 app.use((err, _req, res, _next) => {
