@@ -144,3 +144,13 @@ insert into plans(project_id,code,name,price_cents,currency,interval,features)
 select id,'pro-monthly','TradeVision Pro',3990,'BRL','month','{"analytics":true,"sync":true,"pwa":true}'::jsonb
 from projects where slug='tradevision'
 on conflict(project_id,code) do nothing;
+
+
+insert into projects(slug,name,trial_days)
+values('borderox','BorderoX',90)
+on conflict (slug) do update set name=excluded.name,trial_days=excluded.trial_days,is_active=true;
+
+insert into plans(project_id,code,name,price_cents,currency,interval,features)
+select id,'early-access','BorderoX Early Access',0,'BRL','month','{"bordero_reader":true,"commission_calculator":true,"history":true,"pwa":true}'::jsonb
+from projects where slug='borderox'
+on conflict(project_id,code) do nothing;
