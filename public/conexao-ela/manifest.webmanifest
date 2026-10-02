@@ -1,10 +1,10 @@
 {
-  "id": "/barbara-life/",
+  "id": "/conexao-ela/",
   "name": "Diário da Bárbara 💗",
   "short_name": "Bárbara Life",
   "description": "Seu espaço, seu tempo, sua história.",
-  "start_url": "/barbara-life/",
-  "scope": "/barbara-life/",
+  "start_url": "/conexao-ela/",
+  "scope": "/conexao-ela/",
   "display": "standalone",
   "background_color": "#fff9fb",
   "theme_color": "#b85c7a",

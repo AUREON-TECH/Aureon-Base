@@ -1,6 +1,6 @@
 const CACHE_PREFIX = 'barbara-life-'
 const CACHE_NAME = 'barbara-life-shell-v4-private-vary-range-safe'
-const BASE = '/barbara-life/'
+const BASE = '/conexao-ela/'
 const APP_SHELL = [
   BASE,
   `${BASE}offline.html`,
