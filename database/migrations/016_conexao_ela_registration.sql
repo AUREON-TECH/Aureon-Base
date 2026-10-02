@@ -34,3 +34,17 @@ set name='Conexão Ela',
     default_access_status='lifetime',
     is_active=true
 where slug='barbara-life';
+
+insert into subscriptions(project_id,user_id,status)
+select p.id,pu.user_id,'lifetime'
+from projects p
+join project_users pu on pu.project_id=p.id
+where p.slug='barbara-life'
+on conflict(project_id,user_id) do update
+set status='lifetime',
+    trial_started_at=null,
+    trial_ends_at=null,
+    current_period_start=null,
+    current_period_end=null,
+    canceled_at=null,
+    updated_at=now();
