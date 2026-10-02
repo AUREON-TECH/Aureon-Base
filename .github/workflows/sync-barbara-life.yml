@@ -1,4 +1,4 @@
-name: Sync Barbara Life
+name: Sync Conexão Ela
 
 on:
   push:
@@ -11,7 +11,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: sync-barbara-life
+  group: sync-conexao-ela
   cancel-in-progress: true
 
 jobs:
@@ -24,42 +24,61 @@ jobs:
         with:
           path: aureon-base
 
-      - name: Checkout Barbara Life
+      - name: Checkout Conexão Ela
         uses: actions/checkout@v4
         with:
-          repository: raphaelbuenocaptacao-creator/B-RBARA-LIFE-di-rio-da-vida-dela
+          repository: AUREON-TECH/B-RBARA-LIFE-di-rio-da-vida-dela
           ref: main
-          path: barbara-life
+          path: conexao-ela
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Build Barbara Life
-        working-directory: barbara-life
+      - name: Build Conexão Ela
+        working-directory: conexao-ela
         env:
           GITHUB_PAGES: 'true'
         run: |
           npm install
           npm run build
-          grep -RIl '/B-RBARA-LIFE-di-rio-da-vida-dela/' dist | xargs -r sed -i 's#/B-RBARA-LIFE-di-rio-da-vida-dela/#/barbara-life/#g'
+          grep -RIl '/B-RBARA-LIFE-di-rio-da-vida-dela/' dist | xargs -r sed -i 's#/B-RBARA-LIFE-di-rio-da-vida-dela/#/conexao-ela/#g'
 
-      - name: Publish into Aureon Base public folder
+      - name: Publish Conexão Ela and legacy redirect
         run: |
+          rm -rf aureon-base/public/conexao-ela
+          mkdir -p aureon-base/public/conexao-ela
+          cp -R conexao-ela/dist/. aureon-base/public/conexao-ela/
+
           rm -rf aureon-base/public/barbara-life
           mkdir -p aureon-base/public/barbara-life
-          cp -R barbara-life/dist/. aureon-base/public/barbara-life/
+          cat > aureon-base/public/barbara-life/index.html <<'HTML'
+          <!doctype html>
+          <html lang="pt-BR">
+            <head>
+              <meta charset="utf-8" />
+              <meta name="viewport" content="width=device-width,initial-scale=1" />
+              <meta http-equiv="refresh" content="0; url=/conexao-ela/index.html" />
+              <link rel="canonical" href="/conexao-ela/index.html" />
+              <title>Conexão Ela</title>
+            </head>
+            <body>
+              <p>O Conexão Ela mudou de endereço. <a href="/conexao-ela/index.html">Continuar</a></p>
+              <script>location.replace('/conexao-ela/index.html' + location.search + location.hash)</script>
+            </body>
+          </html>
+          HTML
 
       - name: Commit mirror when changed
         working-directory: aureon-base
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add public/barbara-life
+          git add public/conexao-ela public/barbara-life
           if git diff --cached --quiet; then
-            echo 'Barbara Life mirror already up to date.'
+            echo 'Conexão Ela mirror already up to date.'
             exit 0
           fi
-          git commit -m 'deploy: sync Barbara Life static mirror'
+          git commit -m 'deploy: sync Conexão Ela static mirror'
           git push origin HEAD:main

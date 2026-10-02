@@ -13,6 +13,7 @@ import { registerConsoleRoutes } from './console.js';
 import { registerRealtimeRoutes } from './realtime.js';
 import { issuePasswordResetToken, consumePasswordResetToken, hashResetToken } from './passwordRecovery.js';
 import { verifyGoogleCredential } from './googleAuth.js';
+import { registrationAllowed, defaultAccessStatus, publicProjectJoinAllowed } from './registrationPolicy.js';
 
 const app = express();
 app.disable('x-powered-by');
@@ -118,7 +119,7 @@ async function issueSession(user) {
 }
 
 async function projectBySlug(slug) {
-  const result = await query('select id,slug,name,trial_days,is_active from projects where slug=$1', [slug]);
+  const result = await query('select id,slug,name,trial_days,is_active,registration_mode,default_access_status from projects where slug=$1', [slug]);
   return result.rows[0] || null;
 }
 
@@ -160,8 +161,9 @@ async function ensureProjectAccess(req, res) {
 
 async function enrollUser({ userId, email, project }) {
   await query(`insert into project_users(project_id,user_id,role) values($1,$2,'member') on conflict(project_id,user_id) do nothing`, [project.id, userId]);
-  if (lifetimeEmails.includes(email)) {
-    await query(`insert into subscriptions(project_id,user_id,status) values($1,$2,'lifetime') on conflict(project_id,user_id) do update set status='lifetime',updated_at=now()`, [project.id, userId]);
+  const accessStatus = defaultAccessStatus(project, email, lifetimeEmails);
+  if (accessStatus === 'lifetime') {
+    await query(`insert into subscriptions(project_id,user_id,status) values($1,$2,'lifetime') on conflict(project_id,user_id) do update set status='lifetime',trial_ends_at=null,current_period_end=null,updated_at=now()`, [project.id, userId]);
     return;
   }
   await query(`insert into subscriptions(project_id,user_id,status,trial_started_at,trial_ends_at) values($1,$2,'trialing',now(),now()+($3 || ' days')::interval) on conflict(project_id,user_id) do nothing`, [project.id, userId, String(project.trial_days)]);
@@ -186,9 +188,11 @@ app.post('/auth/register', authLimit, async (req, res) => {
   const password = String(req.body?.password || '');
   const projectSlug = String(req.body?.project_slug || process.env.DEFAULT_PROJECT_SLUG || 'tradevision').trim().toLowerCase();
   if (!emailRegex.test(email) || password.length < 10 || password.length > 128) return res.status(400).json({ error: 'invalid_credentials' });
-  if (allowedEmails.length && !allowedEmails.includes(email)) return res.status(403).json({ error: 'email_not_allowed' });
   const project = await projectBySlug(projectSlug);
   if (!project || !project.is_active) return res.status(404).json({ error: 'project_not_found' });
+  if (!registrationAllowed({ mode: project.registration_mode, email, allowedEmails })) {
+    return res.status(403).json({ error: project.registration_mode === 'closed' ? 'registration_closed' : 'email_not_allowed' });
+  }
   try {
     const id = uuid();
     const passwordHash = await bcrypt.hash(password, 12);
@@ -254,6 +258,25 @@ app.post('/auth/google', authLimit, async (req, res) => {
     if (err?.code === 'google_auth_not_configured') return res.status(503).json({ error: 'google_auth_not_configured' });
     if (err?.code === 'google_token_invalid') return res.status(401).json({ error: 'invalid_google_credential' });
     console.error('google_login_error', err);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.post('/projects/:slug/join', authLimit, requireAuth, async (req, res) => {
+  const project = await projectBySlug(String(req.params.slug || '').trim().toLowerCase());
+  if (!project || !project.is_active) return res.status(404).json({ error: 'project_not_found' });
+  if (!publicProjectJoinAllowed(project)) return res.status(403).json({ error: 'registration_closed' });
+  try {
+    const found = await query('select id,email,is_active from users where id=$1', [req.user.sub]);
+    const user = found.rows[0];
+    if (!user || !user.is_active) return res.status(401).json({ error: 'invalid_user' });
+    await enrollUser({ userId: user.id, email: user.email, project });
+    const subscription = await subscriptionFor(project.id, user.id);
+    const access = accessState(subscription);
+    await audit({ userId: user.id, projectId: project.id, event: 'user.project_joined', req, metadata: { project: project.slug } });
+    return res.json({ project: { slug: project.slug, name: project.name }, subscription, access });
+  } catch (err) {
+    console.error('project_join_error', err);
     return res.status(500).json({ error: 'internal_error' });
   }
 });
