@@ -15,6 +15,7 @@ import { issuePasswordResetToken, consumePasswordResetToken, hashResetToken } fr
 import { verifyGoogleCredential } from './googleAuth.js';
 import { registrationAllowed, defaultAccessStatus, publicProjectJoinAllowed } from './registrationPolicy.js';
 import { buildCorsOrigins, isCorsOriginAllowed } from './corsPolicy.js';
+import { approvalRequired, normalizeApprovalName, pendingApprovalAccess, rejectedApprovalAccess } from './projectApproval.js';
 
 const app = express();
 app.disable('x-powered-by');
@@ -113,7 +114,7 @@ async function issueSession(user) {
 }
 
 async function projectBySlug(slug) {
-  const result = await query('select id,slug,name,trial_days,is_active,registration_mode,default_access_status from projects where slug=$1', [slug]);
+  const result = await query('select id,slug,name,trial_days,is_active,registration_mode,default_access_status,registration_approval_required from projects where slug=$1', [slug]);
   return result.rows[0] || null;
 }
 
@@ -124,6 +125,56 @@ async function projectMembership(slug, userId) {
 
 async function subscriptionFor(projectId, userId) {
   const result = await query(`select s.*,pl.code as plan_code,pl.name as plan_name,pl.price_cents,pl.currency,pl.interval from subscriptions s left join plans pl on pl.id=s.plan_id where s.project_id=$1 and s.user_id=$2`, [projectId, userId]);
+  return result.rows[0] || null;
+}
+
+async function approvalRequestFor(projectId, userId, q = query) {
+  const result = await q(
+    `select project_id,user_id,display_name,status,reviewed_by,reviewed_at,created_at,updated_at
+     from project_access_requests
+     where project_id=$1 and user_id=$2`,
+    [projectId, userId],
+  );
+  return result.rows[0] || null;
+}
+
+async function createOrRefreshAccessRequest({ project, userId, displayName, q = query }) {
+  const normalizedName = normalizeApprovalName(displayName);
+  const result = await q(
+    `insert into project_access_requests(project_id,user_id,display_name,status)
+     values($1,$2,$3,'pending')
+     on conflict(project_id,user_id) do update
+       set display_name=case
+           when project_access_requests.status='approved' then project_access_requests.display_name
+           when excluded.display_name<>'' then excluded.display_name
+           else project_access_requests.display_name
+         end,
+         status=case
+           when project_access_requests.status='approved' then 'approved'
+           else 'pending'
+         end,
+         reviewed_by=case when project_access_requests.status='approved' then project_access_requests.reviewed_by else null end,
+         reviewed_at=case when project_access_requests.status='approved' then project_access_requests.reviewed_at else null end,
+         updated_at=now()
+     returning project_id,user_id,display_name,status,reviewed_by,reviewed_at,created_at,updated_at`,
+    [project.id, userId, normalizedName],
+  );
+  return result.rows[0];
+}
+
+async function projectAdminContext(slug, userId) {
+  const result = await query(
+    `select p.id,p.slug,p.name,pu.role
+     from projects p
+     join project_users pu on pu.project_id=p.id
+     join users u on u.id=pu.user_id
+     where p.slug=$1
+       and pu.user_id=$2
+       and p.is_active=true
+       and u.is_active=true
+       and pu.role in ('owner','admin')`,
+    [slug, userId],
+  );
   return result.rows[0] || null;
 }
 
@@ -153,14 +204,14 @@ async function ensureProjectAccess(req, res) {
   return { membership, subscription, access };
 }
 
-async function enrollUser({ userId, email, project }) {
-  await query(`insert into project_users(project_id,user_id,role) values($1,$2,'member') on conflict(project_id,user_id) do nothing`, [project.id, userId]);
+async function enrollUser({ userId, email, project, q = query }) {
+  await q(`insert into project_users(project_id,user_id,role) values($1,$2,'member') on conflict(project_id,user_id) do nothing`, [project.id, userId]);
   const accessStatus = defaultAccessStatus(project, email, lifetimeEmails);
   if (accessStatus === 'lifetime') {
-    await query(`insert into subscriptions(project_id,user_id,status) values($1,$2,'lifetime') on conflict(project_id,user_id) do update set status='lifetime',trial_ends_at=null,current_period_end=null,updated_at=now()`, [project.id, userId]);
+    await q(`insert into subscriptions(project_id,user_id,status) values($1,$2,'lifetime') on conflict(project_id,user_id) do update set status='lifetime',trial_started_at=null,trial_ends_at=null,current_period_start=null,current_period_end=null,canceled_at=null,updated_at=now()`, [project.id, userId]);
     return;
   }
-  await query(`insert into subscriptions(project_id,user_id,status,trial_started_at,trial_ends_at) values($1,$2,'trialing',now(),now()+($3 || ' days')::interval) on conflict(project_id,user_id) do nothing`, [project.id, userId, String(project.trial_days)]);
+  await q(`insert into subscriptions(project_id,user_id,status,trial_started_at,trial_ends_at) values($1,$2,'trialing',now(),now()+($3 || ' days')::interval) on conflict(project_id,user_id) do nothing`, [project.id, userId, String(project.trial_days)]);
 }
 
 registerConsoleRoutes({ app });
@@ -180,6 +231,7 @@ app.get('/auth/google/config', (_req, res) => {
 app.post('/auth/register', authLimit, async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
   const password = String(req.body?.password || '');
+  const displayName = normalizeApprovalName(req.body?.display_name || '');
   const projectSlug = String(req.body?.project_slug || process.env.DEFAULT_PROJECT_SLUG || 'tradevision').trim().toLowerCase();
   if (!emailRegex.test(email) || password.length < 10 || password.length > 128) return res.status(400).json({ error: 'invalid_credentials' });
   const project = await projectBySlug(projectSlug);
@@ -192,15 +244,34 @@ app.post('/auth/register', authLimit, async (req, res) => {
     const passwordHash = await bcrypt.hash(password, 12);
     const result = await query('insert into users(id,email,password_hash) values($1,$2,$3) returning id,email,created_at', [id, email, passwordHash]);
     const user = result.rows[0];
+
+    if (approvalRequired(project)) {
+      const request = await createOrRefreshAccessRequest({
+        project,
+        userId: id,
+        displayName: displayName || email.split('@')[0],
+      });
+      await audit({ userId: id, projectId: project.id, event: 'user.approval_requested', req, metadata: { email, project: project.slug } });
+      const tokens = await issueSession(user);
+      return res.status(201).json({
+        user,
+        project: { slug: project.slug, name: project.name },
+        approval: { status: request.status, display_name: request.display_name },
+        subscription: null,
+        access: pendingApprovalAccess(),
+        ...tokens,
+      });
+    }
+
     await enrollUser({ userId: id, email, project });
     await audit({ userId: id, projectId: project.id, event: 'user.registered', req, metadata: { email, project: project.slug } });
     const tokens = await issueSession(user);
     const subscription = await subscriptionFor(project.id, id);
-    res.status(201).json({ user, project: { slug: project.slug, name: project.name }, subscription, access: accessState(subscription), ...tokens });
+    return res.status(201).json({ user, project: { slug: project.slug, name: project.name }, subscription, access: accessState(subscription), ...tokens });
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'email_already_exists' });
     console.error('register_error', err);
-    res.status(500).json({ error: 'internal_error' });
+    return res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -264,6 +335,40 @@ app.post('/projects/:slug/join', authLimit, requireAuth, async (req, res) => {
     const found = await query('select id,email,is_active from users where id=$1', [req.user.sub]);
     const user = found.rows[0];
     if (!user || !user.is_active) return res.status(401).json({ error: 'invalid_user' });
+
+    const existingMembership = await projectMembership(project.slug, user.id);
+    if (existingMembership) {
+      const subscription = await subscriptionFor(project.id, user.id);
+      return res.json({
+        project: existingMembership,
+        subscription,
+        access: accessState(subscription),
+      });
+    }
+
+    if (approvalRequired(project)) {
+      const existingRequest = await approvalRequestFor(project.id, user.id);
+      if (existingRequest?.status === 'rejected') {
+        return res.status(403).json({
+          error: 'approval_rejected',
+          approval: { status: 'rejected', display_name: existingRequest.display_name },
+          access: rejectedApprovalAccess(),
+        });
+      }
+      const request = await createOrRefreshAccessRequest({
+        project,
+        userId: user.id,
+        displayName: req.body?.display_name || user.email.split('@')[0],
+      });
+      await audit({ userId: user.id, projectId: project.id, event: 'user.approval_requested', req, metadata: { project: project.slug } });
+      return res.status(202).json({
+        project: { slug: project.slug, name: project.name },
+        approval: { status: request.status, display_name: request.display_name },
+        subscription: null,
+        access: pendingApprovalAccess(),
+      });
+    }
+
     await enrollUser({ userId: user.id, email: user.email, project });
     const subscription = await subscriptionFor(project.id, user.id);
     const access = accessState(subscription);
@@ -382,10 +487,147 @@ app.get('/projects', requireAuth, async (req, res) => {
 });
 
 app.get('/projects/:slug/access', requireAuth, async (req, res) => {
-  const membership = await projectMembership(req.params.slug, req.user.sub);
-  if (!membership) return res.status(403).json({ error: 'project_forbidden' });
+  const project = await projectBySlug(String(req.params.slug || '').trim().toLowerCase());
+  if (!project || !project.is_active) return res.status(404).json({ error: 'project_not_found' });
+
+  const membership = await projectMembership(project.slug, req.user.sub);
+  if (!membership) {
+    const approval = await approvalRequestFor(project.id, req.user.sub);
+    if (approval?.status === 'pending') {
+      return res.status(403).json({
+        error: 'approval_pending',
+        approval: { status: approval.status, display_name: approval.display_name, created_at: approval.created_at },
+        access: pendingApprovalAccess(),
+      });
+    }
+    if (approval?.status === 'rejected') {
+      return res.status(403).json({
+        error: 'approval_rejected',
+        approval: { status: approval.status, display_name: approval.display_name, reviewed_at: approval.reviewed_at },
+        access: rejectedApprovalAccess(),
+      });
+    }
+    return res.status(403).json({ error: 'project_forbidden' });
+  }
+
   const subscription = await subscriptionFor(membership.id, req.user.sub);
-  res.json({ project: membership, subscription, access: accessState(subscription) });
+  return res.json({ project: membership, subscription, access: accessState(subscription) });
+});
+
+app.get('/projects/:slug/approval-status', requireAuth, async (req, res) => {
+  const project = await projectBySlug(String(req.params.slug || '').trim().toLowerCase());
+  if (!project || !project.is_active) return res.status(404).json({ error: 'project_not_found' });
+
+  const membership = await projectMembership(project.slug, req.user.sub);
+  if (membership) {
+    const subscription = await subscriptionFor(project.id, req.user.sub);
+    return res.json({
+      approval: { status: 'approved' },
+      project: membership,
+      access: accessState(subscription),
+    });
+  }
+
+  const request = await approvalRequestFor(project.id, req.user.sub);
+  if (!request) return res.json({ approval: { status: 'none' }, access: { allowed: false, status: 'none', reason: 'no_request' } });
+  return res.json({
+    approval: {
+      status: request.status,
+      display_name: request.display_name,
+      created_at: request.created_at,
+      reviewed_at: request.reviewed_at,
+    },
+    access: request.status === 'rejected' ? rejectedApprovalAccess() : pendingApprovalAccess(),
+  });
+});
+
+app.get('/projects/:slug/admin/access-requests', requireAuth, async (req, res) => {
+  const ctx = await projectAdminContext(String(req.params.slug || '').trim().toLowerCase(), req.user.sub);
+  if (!ctx) return res.status(403).json({ error: 'project_admin_required' });
+
+  const status = String(req.query.status || 'pending').trim().toLowerCase();
+  if (!['pending','approved','rejected','all'].includes(status)) return res.status(400).json({ error: 'invalid_approval_status' });
+
+  const params = [ctx.id];
+  let filter = '';
+  if (status !== 'all') {
+    params.push(status);
+    filter = 'and r.status=$2';
+  }
+
+  const result = await query(
+    `select r.user_id,u.email,r.display_name,r.status,r.reviewed_by,r.reviewed_at,r.created_at,r.updated_at
+     from project_access_requests r
+     join users u on u.id=r.user_id
+     where r.project_id=$1
+       ${filter}
+     order by case when r.status='pending' then 0 else 1 end, r.created_at asc`,
+    params,
+  );
+  return res.json(result.rows);
+});
+
+app.post('/projects/:slug/admin/access-requests/:userId/approve', requireAuth, async (req, res) => {
+  const slug = String(req.params.slug || '').trim().toLowerCase();
+  const ctx = await projectAdminContext(slug, req.user.sub);
+  if (!ctx) return res.status(403).json({ error: 'project_admin_required' });
+  const project = await projectBySlug(slug);
+  if (!project) return res.status(404).json({ error: 'project_not_found' });
+
+  try {
+    const approved = await withTransaction(async (q) => {
+      const requestResult = await q(
+        `select r.user_id,r.display_name,r.status,u.email,u.is_active
+         from project_access_requests r
+         join users u on u.id=r.user_id
+         where r.project_id=$1 and r.user_id=$2
+         for update`,
+        [project.id, req.params.userId],
+      );
+      const request = requestResult.rows[0];
+      if (!request || !request.is_active) return null;
+
+      await enrollUser({ userId: request.user_id, email: request.email, project, q });
+      await q(
+        `update project_access_requests
+         set status='approved',reviewed_by=$1,reviewed_at=now(),updated_at=now()
+         where project_id=$2 and user_id=$3`,
+        [req.user.sub, project.id, request.user_id],
+      );
+      return request;
+    });
+
+    if (!approved) return res.status(404).json({ error: 'approval_request_not_found' });
+    await audit({ userId: req.user.sub, projectId: project.id, event: 'project.user_approved', req, metadata: { target_user_id: req.params.userId } });
+    const subscription = await subscriptionFor(project.id, req.params.userId);
+    return res.json({
+      user_id: req.params.userId,
+      approval: { status: 'approved' },
+      subscription,
+      access: accessState(subscription),
+    });
+  } catch (err) {
+    console.error('project_approval_error', err);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.post('/projects/:slug/admin/access-requests/:userId/reject', requireAuth, async (req, res) => {
+  const slug = String(req.params.slug || '').trim().toLowerCase();
+  const ctx = await projectAdminContext(slug, req.user.sub);
+  if (!ctx) return res.status(403).json({ error: 'project_admin_required' });
+
+  const result = await query(
+    `update project_access_requests
+     set status='rejected',reviewed_by=$1,reviewed_at=now(),updated_at=now()
+     where project_id=$2 and user_id=$3 and status='pending'
+     returning user_id,display_name,status,reviewed_at`,
+    [req.user.sub, ctx.id, req.params.userId],
+  );
+  if (!result.rows[0]) return res.status(404).json({ error: 'approval_request_not_found' });
+
+  await audit({ userId: req.user.sub, projectId: ctx.id, event: 'project.user_rejected', req, metadata: { target_user_id: req.params.userId } });
+  return res.json(result.rows[0]);
 });
 
 app.get('/projects/:slug/plans', async (req, res) => {
