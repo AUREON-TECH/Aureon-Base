@@ -8,6 +8,6 @@
   <rect width="512" height="512" rx="150" fill="#fff7fa"/>
   <rect x="56" y="56" width="400" height="400" rx="128" fill="url(#g)"/>
   <circle cx="385" cy="130" r="54" fill="#ffffff" opacity=".16"/>
-  <text x="256" y="315" text-anchor="middle" font-family="Georgia,serif" font-size="190" font-weight="700" fill="#fff">B</text>
+  <text x="256" y="315" text-anchor="middle" font-family="Georgia,serif" font-size="132" font-weight="700" fill="#fff">CE</text>
   <path d="M343 356c22-31 73-6 51 31-12 20-51 43-51 43s-39-23-51-43c-22-37 29-62 51-31Z" fill="#fceaf0"/>
 </svg>
