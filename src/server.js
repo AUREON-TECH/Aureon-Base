@@ -14,23 +14,17 @@ import { registerRealtimeRoutes } from './realtime.js';
 import { issuePasswordResetToken, consumePasswordResetToken, hashResetToken } from './passwordRecovery.js';
 import { verifyGoogleCredential } from './googleAuth.js';
 import { registrationAllowed, defaultAccessStatus, publicProjectJoinAllowed } from './registrationPolicy.js';
+import { buildCorsOrigins, isCorsOriginAllowed } from './corsPolicy.js';
 
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
 app.use(helmet());
 
-const builtInOrigins = [
-  'https://raphaelbuenocaptacao-creator.github.io',
-  'http://localhost:5500',
-  'http://127.0.0.1:5500',
-];
-const configuredOrigins = (process.env.CORS_ORIGINS || '').split(',').map(v => v.trim()).filter(Boolean);
-const corsOrigins = new Set([...builtInOrigins, ...configuredOrigins]);
+const corsOrigins = buildCorsOrigins(process.env.CORS_ORIGINS || '');
 app.use(cors({
   origin(origin, cb) {
-    if (!origin || corsOrigins.has('*') || corsOrigins.has(origin)) return cb(null, true);
-    return cb(null, false);
+    return cb(null, isCorsOriginAllowed(origin, corsOrigins));
   },
   credentials: false,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
