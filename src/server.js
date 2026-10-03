@@ -768,4 +768,8 @@ app.use((err, _req, res, _next) => {
 });
 
 const port = Number(process.env.PORT || 3000);
-app.listen(port, () => console.log(`Aureon Base v0.6.0 listening on :${port}`));
+if (!process.env.VERCEL) {
+  app.listen(port, () => console.log(`Aureon Base v0.6.0 listening on :${port}`));
+}
+
+export default app;
