@@ -18,7 +18,6 @@ CREATE POLICY project_records_tenant_scope ON project_records
         WHERE pu.project_id = project_records.project_id
           AND pu.user_id = aureon_current_user_id()
           AND pu.role IN ('owner','admin')
-          AND pu.is_active = true
       )
     )
   )
@@ -32,7 +31,6 @@ CREATE POLICY project_records_tenant_scope ON project_records
         WHERE pu.project_id = project_records.project_id
           AND pu.user_id = aureon_current_user_id()
           AND pu.role IN ('owner','admin')
-          AND pu.is_active = true
       )
     )
   );
