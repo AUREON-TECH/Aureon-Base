@@ -233,7 +233,7 @@ app.post('/auth/register', authLimit, async (req, res) => {
   const password = String(req.body?.password || '');
   const displayName = normalizeApprovalName(req.body?.display_name || '');
   const projectSlug = String(req.body?.project_slug || process.env.DEFAULT_PROJECT_SLUG || 'tradevision').trim().toLowerCase();
-  if (!emailRegex.test(email) || password.length < 10 || password.length > 128) return res.status(400).json({ error: 'invalid_credentials' });
+  if (!emailRegex.test(email) || password.length < 6 || password.length > 128) return res.status(400).json({ error: 'invalid_credentials' });
   const project = await projectBySlug(projectSlug);
   if (!project || !project.is_active) return res.status(404).json({ error: 'project_not_found' });
   if (!registrationAllowed({ mode: project.registration_mode, email, allowedEmails })) {
@@ -409,7 +409,7 @@ app.post('/auth/logout', requireAuth, async (req, res) => {
 app.post('/auth/change-password', authLimit, requireAuth, async (req, res) => {
   const currentPassword = String(req.body?.current_password || '');
   const newPassword = String(req.body?.new_password || '');
-  if (newPassword.length < 10 || newPassword.length > 128 || newPassword === currentPassword) return res.status(400).json({ error: 'invalid_new_password' });
+  if (newPassword.length < 6 || newPassword.length > 128 || newPassword === currentPassword) return res.status(400).json({ error: 'invalid_new_password' });
   try {
     const found = await query('select id,password_hash from users where id=$1 and is_active=true', [req.user.sub]);
     const user = found.rows[0];
