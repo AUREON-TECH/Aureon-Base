@@ -7,13 +7,13 @@ import pg from 'pg';
 const databaseUrl = process.env.INTEGRATION_DATABASE_URL || process.env.DATABASE_URL;
 const migrationSql = fs.readFileSync(new URL('../database/migrations/016_conexao_ela_registration.sql', import.meta.url), 'utf8');
 
-test('Conexão Ela migration upgrades existing project members to lifetime access', { skip: !databaseUrl }, async () => {
+test('Conexão Ela migration preserves lifetime access for existing project members to lifetime access', { skip: !databaseUrl }, async () => {
   const client = new pg.Client({ connectionString: databaseUrl });
   await client.connect();
   await client.query('begin');
   try {
-    const project = await client.query("select id from projects where slug='barbara-life'");
-    assert.ok(project.rows[0]?.id, 'barbara-life project must exist after migrations');
+    const project = await client.query("select id from projects where slug='conexao-ela'");
+    assert.ok(project.rows[0]?.id, 'conexao-ela project must exist after migrations');
 
     const userId = crypto.randomUUID();
     const email = `migration-${userId}@example.test`;
